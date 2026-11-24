@@ -275,6 +275,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn breadcrumbs_show_progress_in_a_long_barrier_interval() {
+        let mut history = vec![D3D12_AUTO_BREADCRUMB_OP_DISPATCH; 40];
+        history[28] = D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
+        history[29] = D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH;
+        let markers = [(28, "mesh 1 [mesh fixture]".to_owned())];
+
+        let report = in_flight(&history, &markers, 29);
+        assert!(report.contains("command 29 (op 42): mesh 1 [mesh fixture]"));
+        assert_eq!(report.matches("; command ").count(), 12);
+    }
+
     /// A node of the device-removed data is a list by pointer or by name.
     /// The name is what still matches when the runtime records another
     /// object than the one we hold (the debug layer wraps ours), and a
@@ -2063,14 +2075,12 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .iter()
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
+    let is_command = |&i: &usize| history[i] != D3D12_AUTO_BREADCRUMB_OP_SETMARKER;
+    // Keep useful context on either side of the breadcrumb counter.
+    let first = (from..done).rev().filter(is_command).nth(5).unwrap_or(from);
     let mut text = format!(", commands {from}..{to} between its barriers:");
-    let mut shown = 0;
-    for i in from..to {
+    for i in (first..to).filter(is_command).take(12) {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
-            continue;
-        }
-        shown += 1;
         let marker = i
             .checked_sub(1)
             .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
