@@ -594,4 +594,134 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// Words of a 128-thread mesh program: `m0 = 0x3003` (3 vertices, 3
+    /// primitives), the group id read by its first lane, and `body`.
+    fn mesh_words(body: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBEFC_03FF, // s_mov_b32 m0, lit
+            0x0000_3003,
+            0x7E04_0505, // v_readfirstlane_b32 s2, v5
+        ];
+        words.extend_from_slice(body);
+        words
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    const S_SENDMSG_ALLOC: u32 = 0xBF90_0009;
+    const S_CMP_EQ_U32_S2_0: u32 = 0xBF06_8002;
+    const V_MOV_B32_V9_0: u32 = 0x7E12_0280;
+    const EXP_PRIM_V9: [u32; 2] = [0xF800_0941, 0x0000_0009];
+
+    /// The translation of a mesh program, with what the plan found.
+    fn mesh_translation(
+        words: &[u32],
+    ) -> (
+        Option<super::lower::MsCounts>,
+        Result<super::HostShader, crate::ShaderError>,
+    ) {
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let plan = super::lower::ms_counts_plan(&p, &st, 0);
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        (plan, emit(&c, &native, &p, &st, &io, &res))
+    }
+
+    /// Validates an emitted module with `dxil.dll` where it is found.
+    fn validates(shader: &super::HostShader) {
+        let path = super::validator::Validator::default_path();
+        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        v.validate(&mut shader.dxil.clone()).unwrap();
+    }
+
+    /// A mesh whose group skips the allocation request on one path and
+    /// sends it on the other: the counts are staged at the request and
+    /// declared once at the join, and the module validates (DXIL takes one
+    /// `SetMeshOutputCounts` that dominates every output write). The
+    /// request's own dummy path exports nothing; the join does.
+    #[test]
+    fn a_mesh_allocation_request_is_declared_once_at_the_join() {
+        let mut body = vec![
+            S_CMP_EQ_U32_S2_0,
+            0xBF85_0001, // s_cbranch_scc1 +1: the culled path skips the request
+            S_SENDMSG_ALLOC,
+            S_BARRIER, // the join
+            V_MOV_B32_V9_0,
+        ];
+        body.extend(EXP_PRIM_V9);
+        body.push(S_ENDPGM);
+        let (plan, shader) = mesh_translation(&mesh_words(&body));
+        let plan = plan.expect("the two-path request is planned");
+        assert_eq!(plan.sites.len(), 1);
+        assert_ne!(plan.join, plan.sites[0].0, "the join is not the request");
+        validates(&shader.expect("a planned mesh translates"));
+    }
+
+    /// The shapes that do not fit keep the declared maxima, still translate
+    /// and validate, and are never refused: an export before the request,
+    /// a path that leaves without reaching the join, and no request at all.
+    #[test]
+    fn a_mesh_allocation_request_that_does_not_fit_keeps_the_maxima() {
+        // An export before the request: no counts exist yet.
+        let mut early = vec![V_MOV_B32_V9_0];
+        early.extend(EXP_PRIM_V9);
+        early.extend([
+            S_CMP_EQ_U32_S2_0,
+            0xBF85_0001,
+            S_SENDMSG_ALLOC,
+            S_BARRIER,
+            S_ENDPGM,
+        ]);
+        // One path ends before the request's join: not every thread
+        // reaches it.
+        let mut leaves = vec![
+            S_CMP_EQ_U32_S2_0,
+            0xBF84_0001, // s_cbranch_scc0 +1: past the early end
+            S_ENDPGM,
+            S_CMP_EQ_U32_S2_0,
+            0xBF85_0001, // s_cbranch_scc1 +1: the culled path skips the request
+            S_SENDMSG_ALLOC,
+            S_BARRIER,
+            V_MOV_B32_V9_0,
+        ];
+        leaves.extend(EXP_PRIM_V9);
+        leaves.push(S_ENDPGM);
+        // No request: the maxima, as before.
+        let mut none = vec![S_BARRIER, V_MOV_B32_V9_0];
+        none.extend(EXP_PRIM_V9);
+        none.push(S_ENDPGM);
+        for (what, body) in [
+            ("export before the request", early),
+            ("a path that leaves early", leaves),
+            ("no request", none),
+        ] {
+            let (plan, shader) = mesh_translation(&mesh_words(&body));
+            assert!(plan.is_none(), "{what} was planned");
+            validates(&shader.unwrap_or_else(|e| panic!("{what}: {e}")));
+        }
+    }
 }
